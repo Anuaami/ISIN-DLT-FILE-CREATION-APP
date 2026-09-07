@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Output directories & scratch test data
+output/
+test_cli_output/
+*.xlsx
+*.xls
+*.zip
+
+# Keep sample generator
+!sample_data.xlsx
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
