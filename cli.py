@@ -8,6 +8,7 @@ from core_processor import (
     split_by_isin,
     dataframe_to_styled_excel,
     create_isin_zip_archive,
+    detect_header_row,
     TARGET_COLUMNS,
 )
 
@@ -23,8 +24,10 @@ def process_excel_file(
     input_path: str,
     output_dir: str,
     sheet_name: str = None,
+    header_row: int = None,
     create_zip: bool = True,
     fill_missing: bool = True,
+    drop_summary: bool = True,
 ):
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -38,17 +41,27 @@ def process_excel_file(
         sheet_name = excel_file.sheet_names[0]
     print(f"[INFO] Processing Sheet: '{sheet_name}'")
 
-    raw_df = excel_file.parse(sheet_name)
+    if header_row is None:
+        preview_df = excel_file.parse(sheet_name, header=None, nrows=30)
+        auto_idx, match_count = detect_header_row(preview_df)
+        header_row = auto_idx + 1
+        print(f"[INFO] Auto-detected Header Row: {header_row} ({match_count}/{len(TARGET_COLUMNS)} target columns matched)")
+    else:
+        print(f"[INFO] Using specified Header Row: {header_row}")
+
+    raw_df = excel_file.parse(sheet_name, header=header_row - 1)
     print(f"[INFO] Loaded {len(raw_df)} rows and {len(raw_df.columns)} columns.")
 
-    filtered_df, col_mapping, missing_targets, dropped_columns = process_dataframe(
-        raw_df, fill_missing_cols=fill_missing
+    filtered_df, col_mapping, missing_targets, dropped_columns, dropped_summary_rows = process_dataframe(
+        raw_df, fill_missing_cols=fill_missing, drop_summary_rows=drop_summary
     )
 
     print(f"[INFO] Dropped {len(dropped_columns)} unwanted columns: {dropped_columns}")
     if missing_targets:
         print(f"[WARN] Missing target columns ({len(missing_targets)}): {missing_targets}")
-    print(f"[INFO] Filtered to {len(filtered_df.columns)} target columns.")
+    if dropped_summary_rows > 0:
+        print(f"[INFO] Excluded {dropped_summary_rows} footer / summary total rows.")
+    print(f"[INFO] Filtered dataset has {len(filtered_df)} records with {len(filtered_df.columns)} target columns.")
 
     isin_groups = split_by_isin(filtered_df)
     print(f"[INFO] Found {len(isin_groups)} ISIN groups: {list(isin_groups.keys())}\n")
@@ -93,6 +106,12 @@ def main():
         help="Name of sheet to process (defaults to the first sheet)",
     )
     parser.add_argument(
+        "--header-row",
+        type=int,
+        default=None,
+        help="1-indexed row number where column headers are located (auto-detected if omitted)",
+    )
+    parser.add_argument(
         "--no-zip",
         action="store_true",
         help="Skip creating the bundled all_isin_files.zip archive",
@@ -102,14 +121,21 @@ def main():
         action="store_true",
         help="Do not fill missing target columns with blanks",
     )
+    parser.add_argument(
+        "--keep-summary",
+        action="store_true",
+        help="Do not filter out trailing summary/total rows",
+    )
 
     args = parser.parse_args()
     process_excel_file(
         input_path=args.input,
         output_dir=args.output_dir,
         sheet_name=args.sheet,
+        header_row=args.header_row,
         create_zip=not args.no_zip,
         fill_missing=not args.no_fill_missing,
+        drop_summary=not args.keep_summary,
     )
 
 

@@ -40,15 +40,63 @@ TARGET_COLUMNS = [
     "benpos_date",
 ]
 
+# Common variations/synonyms for financial/interest registers
+SYNONYMS: Dict[str, List[str]] = {
+    "interest_id": ["dividend_id", "interestid", "dividendid", "int_id", "intid"],
+    "isin_code": ["isin", "isincode", "isin_no", "isin_number", "isin_num"],
+    "unit_code": ["unitcode", "unit_cd", "company_code", "comp_code"],
+    "security_code": ["securitycode", "security_cd", "sec_code", "seccod", "sec_cod"],
+    "int_type": ["inttype", "interest_type", "type_of_interest"],
+    "holder_folio": ["folio", "folio_no", "foliono", "holderfolio", "folio_number", "reg_folio"],
+    "holder": ["holder_name", "holdername", "investor_name", "first_holder_name", "shareholder_name"],
+    "holder_pin": ["holder_pincode", "holderpin", "pincode", "pin_code", "pin"],
+    "bank_accno": ["bank_account_no", "bank_acc_no", "bank_account", "bank_ac_no", "bank_acno", "acc_no", "account_no", "acno"],
+    "ifsc_code": ["ifsc", "ifsccode", "ifsc_cd"],
+    "bfitpan": ["pan", "pan_no", "panno", "pan_number", "first_holder_pan"],
+    "ecs_actype": ["ecs_ac_type", "account_type", "ac_type", "actype"],
+}
+
 
 def normalize_col_name(col: str) -> str:
     """Normalize column name for robust case-insensitive matching."""
     if not isinstance(col, str):
-        col = str(col)
-    # Remove leading/trailing spaces, lowercase, replace spaces/hyphens with underscore
+        col = str(col) if pd.notna(col) else ""
     normalized = col.strip().lower()
     normalized = re.sub(r"[\s\-]+", "_", normalized)
     return normalized
+
+
+def detect_header_row(raw_df: pd.DataFrame, max_rows: int = 30) -> Tuple[int, int]:
+    """
+    Scans the first `max_rows` rows of a raw DataFrame (loaded with header=None).
+    Returns:
+        (best_row_index, match_count) where best_row_index is 0-indexed.
+    """
+    target_norms = {normalize_col_name(tc): tc for tc in TARGET_COLUMNS}
+    synonym_norms = {}
+    for canonical, syn_list in SYNONYMS.items():
+        for syn in syn_list:
+            synonym_norms[normalize_col_name(syn)] = canonical
+
+    best_row = 0
+    best_matches = 0
+    limit = min(max_rows, len(raw_df))
+
+    for r_idx in range(limit):
+        row_vals = [normalize_col_name(v) for v in raw_df.iloc[r_idx].values if pd.notna(v)]
+        matched_targets = set()
+        for val in row_vals:
+            if val in target_norms:
+                matched_targets.add(target_norms[val])
+            elif val in synonym_norms:
+                matched_targets.add(synonym_norms[val])
+
+        match_count = len(matched_targets)
+        if match_count > best_matches:
+            best_matches = match_count
+            best_row = r_idx
+
+    return best_row, best_matches
 
 
 def map_columns(source_columns: List[str]) -> Tuple[Dict[str, str], List[str], List[str]]:
@@ -60,6 +108,10 @@ def map_columns(source_columns: List[str]) -> Tuple[Dict[str, str], List[str], L
         dropped_columns: list of source columns that will be discarded
     """
     target_norm_map = {normalize_col_name(tc): tc for tc in TARGET_COLUMNS}
+    synonym_norm_map = {}
+    for canonical, syn_list in SYNONYMS.items():
+        for syn in syn_list:
+            synonym_norm_map[normalize_col_name(syn)] = canonical
 
     col_mapping = {}
     found_targets = set()
@@ -71,6 +123,10 @@ def map_columns(source_columns: List[str]) -> Tuple[Dict[str, str], List[str], L
             canonical = target_norm_map[norm_src]
             col_mapping[src_col] = canonical
             found_targets.add(canonical)
+        elif norm_src in synonym_norm_map:
+            canonical = synonym_norm_map[norm_src]
+            col_mapping[src_col] = canonical
+            found_targets.add(canonical)
         else:
             dropped_columns.append(src_col)
 
@@ -79,11 +135,12 @@ def map_columns(source_columns: List[str]) -> Tuple[Dict[str, str], List[str], L
 
 
 def process_dataframe(
-    df: pd.DataFrame, fill_missing_cols: bool = True
-) -> Tuple[pd.DataFrame, Dict[str, str], List[str], List[str]]:
+    df: pd.DataFrame, fill_missing_cols: bool = True, drop_summary_rows: bool = True
+) -> Tuple[pd.DataFrame, Dict[str, str], List[str], List[str], int]:
     """
     Filters df to only the target columns in the exact order specified.
     Renames matched columns to canonical names.
+    Optionally drops blank / summary / grand total footer rows.
     """
     col_mapping, missing_targets, dropped_columns = map_columns(list(df.columns))
 
@@ -94,14 +151,38 @@ def process_dataframe(
     cols_to_keep = [col for col in TARGET_COLUMNS if col in filtered_df.columns]
     filtered_df = filtered_df[cols_to_keep].copy()
 
-    # Fill missing columns with empty string/None if requested to preserve strict 30-column layout
+    # Fill missing columns with None if requested to preserve strict 30-column layout
     if fill_missing_cols:
         for missing_col in missing_targets:
             filtered_df[missing_col] = None
-        # Ensure exact order of all 30 target columns
         filtered_df = filtered_df[TARGET_COLUMNS]
 
-    return filtered_df, col_mapping, missing_targets, dropped_columns
+    dropped_summary_rows = 0
+    if drop_summary_rows and "isin_code" in filtered_df.columns:
+        initial_len = len(filtered_df)
+
+        def is_valid_data_row(row) -> bool:
+            isin_val = str(row["isin_code"]).strip() if pd.notna(row["isin_code"]) else ""
+            # If isin_code is present and doesn't say "total", it is a valid row
+            if isin_val and not isin_val.lower().startswith("total"):
+                return True
+            # If isin is missing, check if this is a grand total / summary footer row
+            # e.g., holder and interest_id are both missing, or contain "total"
+            holder_val = str(row.get("holder", "")).strip().lower() if pd.notna(row.get("holder")) else ""
+            iid_val = str(row.get("interest_id", "")).strip().lower() if pd.notna(row.get("interest_id")) else ""
+            folio_val = str(row.get("holder_folio", "")).strip().lower() if pd.notna(row.get("holder_folio")) else ""
+
+            if not holder_val and not iid_val and not folio_val:
+                return False  # Blank row or grand total footer
+            if "total" in holder_val or "total" in iid_val or "total" in folio_val:
+                return False  # Total summary row
+            return True
+
+        mask = filtered_df.apply(is_valid_data_row, axis=1)
+        filtered_df = filtered_df[mask].copy()
+        dropped_summary_rows = initial_len - len(filtered_df)
+
+    return filtered_df, col_mapping, missing_targets, dropped_columns, dropped_summary_rows
 
 
 def split_by_isin(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
@@ -112,7 +193,7 @@ def split_by_isin(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     if "isin_code" not in df.columns:
         raise ValueError("Column 'isin_code' is missing from the data.")
 
-    # Create a copy and clean isin_code
+    # Create cleaned isin series
     isin_series = df["isin_code"].fillna("").astype(str).str.strip()
 
     groups: Dict[str, pd.DataFrame] = {}

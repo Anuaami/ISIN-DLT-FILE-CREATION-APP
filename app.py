@@ -5,6 +5,7 @@ import streamlit as st
 
 from core_processor import (
     TARGET_COLUMNS,
+    detect_header_row,
     process_dataframe,
     split_by_isin,
     dataframe_to_styled_excel,
@@ -12,7 +13,7 @@ from core_processor import (
 )
 from generate_sample import create_sample_excel
 
-# Set page config
+# Page configuration
 st.set_page_config(
     page_title="ISIN Excel Splitter & Column Reducer",
     page_icon="📊",
@@ -20,7 +21,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS for polished, modern look
+# Custom CSS for styling
 st.markdown(
     """
     <style>
@@ -78,6 +79,15 @@ st.markdown(
         color: #991B1B;
         border: 1px solid #FECACA;
     }
+    .info-banner {
+        background-color: #EFF6FF;
+        border-left: 4px solid #3B82F6;
+        padding: 10px 14px;
+        border-radius: 4px;
+        margin-bottom: 15px;
+        font-size: 0.95rem;
+        color: #1E40AF;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -92,7 +102,13 @@ with st.sidebar:
     fill_missing = st.checkbox(
         "Fill Missing Target Columns",
         value=True,
-        help="If any of the 30 required columns are missing from the uploaded file, fill them with blank values to preserve exact schema format.",
+        help="If any of the 30 required columns are missing, keep them with blank values to preserve exact schema format.",
+    )
+
+    drop_summary = st.checkbox(
+        "Exclude Summary/Total Footer Rows",
+        value=True,
+        help="Automatically detects and removes trailing grand-total / summary rows so output files contain pure record data.",
     )
 
     st.markdown("---")
@@ -104,14 +120,14 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Excel ISIN Filter & Splitter • Built with Streamlit & OpenPyXL")
 
-# Main Page Header
+# Main Header
 st.markdown('<div class="main-header">📊 Excel ISIN Filter & Splitter</div>', unsafe_allow_html=True)
 st.markdown(
     '<div class="sub-header">Upload an Excel file to automatically strip unwanted columns, retain the 30 specified attributes, and generate individual ISIN-wise workbooks.</div>',
     unsafe_allow_html=True,
 )
 
-# File uploader section
+# File uploader & sample load
 col_upload, col_sample = st.columns([3, 1])
 
 with col_upload:
@@ -142,35 +158,66 @@ if file_source is not None:
         excel_file = pd.ExcelFile(file_source)
         sheet_names = excel_file.sheet_names
 
-        selected_sheet = sheet_names[0]
-        if len(sheet_names) > 1:
-            selected_sheet = st.selectbox(
-                "Select Sheet to Process",
-                sheet_names,
-                index=0,
-                help="This workbook has multiple sheets. Please choose the sheet you want to filter and split.",
+        col_sheet, col_header_row = st.columns([2, 1])
+
+        with col_sheet:
+            selected_sheet = sheet_names[0]
+            if len(sheet_names) > 1:
+                selected_sheet = st.selectbox(
+                    "Select Sheet to Process",
+                    sheet_names,
+                    index=0,
+                    help="This workbook has multiple sheets. Choose the one to process.",
+                )
+
+        # Pre-scan top 30 rows to auto-detect header row
+        preview_raw = excel_file.parse(selected_sheet, header=None, nrows=30)
+        auto_detected_idx, match_count = detect_header_row(preview_raw)
+        auto_detected_row_1indexed = auto_detected_idx + 1
+
+        with col_header_row:
+            header_row_choice = st.number_input(
+                "Header Row in Excel",
+                min_value=1,
+                max_value=max(len(preview_raw), 1),
+                value=auto_detected_row_1indexed,
+                step=1,
+                help=f"Row containing the column headers. Auto-detected as Row {auto_detected_row_1indexed}.",
             )
 
-        # Load raw data
-        raw_df = excel_file.parse(selected_sheet)
+        if match_count > 0:
+            if auto_detected_row_1indexed > 1:
+                st.markdown(
+                    f'<div class="info-banner">✨ <b>Header row auto-detected at Row {auto_detected_row_1indexed}</b> ({match_count} of 30 target columns found). Title lines on Rows 1 to {auto_detected_row_1indexed - 1} are automatically skipped.</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f'<div class="info-banner">✨ <b>Header row auto-detected at Row 1</b> ({match_count} of 30 target columns found).</div>',
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.warning("⚠️ No standard target column names matched in the first rows. Please ensure the correct Header Row is selected above.")
 
-        if raw_df.empty:
-            st.error("The selected sheet is empty.")
+        # Load data using chosen header row
+        df_raw = excel_file.parse(selected_sheet, header=header_row_choice - 1)
+
+        if df_raw.empty:
+            st.error("The selected sheet is empty under the specified header row.")
             st.stop()
 
-        # Process columns
-        filtered_df, col_mapping, missing_targets, dropped_columns = process_dataframe(
-            raw_df, fill_missing_cols=fill_missing
+        # Process columns and rows
+        filtered_df, col_mapping, missing_targets, dropped_columns, dropped_summary_rows = process_dataframe(
+            df_raw, fill_missing_cols=fill_missing, drop_summary_rows=drop_summary
         )
 
-        # Check if isin_code is available
+        # Check if isin_code is present
         if "isin_code" not in filtered_df.columns or filtered_df["isin_code"].isnull().all():
-            st.warning("⚠️ Warning: 'isin_code' column is missing or empty. Please verify your file structure.")
+            st.warning("⚠️ Warning: 'isin_code' column could not be found or is completely empty. Please verify the Header Row setting above.")
 
         # Split by ISIN
         isin_groups = split_by_isin(filtered_df)
         unique_isin_count = len([k for k in isin_groups.keys() if k != "UNASSIGNED_ISIN"])
-        unassigned_count = len(isin_groups.get("UNASSIGNED_ISIN", []))
 
         # Metric cards
         m1, m2, m3, m4 = st.columns(4)
@@ -178,8 +225,8 @@ if file_source is not None:
             st.markdown(
                 f"""
                 <div class="metric-card">
-                    <div class="metric-value">{len(raw_df):,}</div>
-                    <div class="metric-label">Total Rows</div>
+                    <div class="metric-value">{len(filtered_df):,}</div>
+                    <div class="metric-label">Data Records</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -214,6 +261,9 @@ if file_source is not None:
                 """,
                 unsafe_allow_html=True,
             )
+
+        if dropped_summary_rows > 0:
+            st.caption(f"ℹ️ Excluded {dropped_summary_rows} footer/summary row(s) (e.g. Grand Total) to keep output files clean.")
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -251,7 +301,7 @@ if file_source is not None:
         down_col1, down_col2 = st.columns([2, 1])
         with down_col1:
             st.subheader("📦 Download Processed Files")
-            st.markdown("Download all ISIN-wise Excel files packaged neatly into a single ZIP archive, or download individually below.")
+            st.markdown("Download all ISIN-wise Excel files packaged into a single ZIP archive, or download individually below.")
         with down_col2:
             zip_data = create_isin_zip_archive(isin_groups)
             st.download_button(
@@ -267,7 +317,6 @@ if file_source is not None:
         tab_summary, tab_inspect = st.tabs(["📋 Summary by ISIN", "🔎 Inspect & Download Individual ISIN"])
 
         with tab_summary:
-            # Summary Table
             summary_data = []
             for isin, group_df in isin_groups.items():
                 record_count = len(group_df)
@@ -292,7 +341,7 @@ if file_source is not None:
 
             col_sub_info, col_sub_btn = st.columns([3, 1])
             with col_sub_info:
-                st.markdown(f"**Showing {len(target_group_df)} records for `{chosen_isin}`** (all 30 filtered columns retained in order):")
+                st.markdown(f"**Showing {len(target_group_df)} records for `{chosen_isin}`** (all 30 filtered columns in exact order):")
             with col_sub_btn:
                 single_excel_bytes = dataframe_to_styled_excel(target_group_df, sheet_name=chosen_isin[:31])
                 st.download_button(
