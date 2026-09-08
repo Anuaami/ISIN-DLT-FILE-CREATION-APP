@@ -61,6 +61,8 @@ python cli.py "C:\path\to\your_input.xlsx" --output-dir "./output"
 **CLI Options**:
 - `-o, --output-dir`: Target folder for output files (default: `./output`).
 - `-s, --sheet`: Specify sheet name (defaults to first sheet).
+- `--header-row`: 1-indexed row number for column headers (auto-detected if omitted).
+- `--keep-summary`: Do not filter out trailing summary/grand-total rows.
 - `--no-zip`: Skip generating the consolidated `.zip` file.
 - `--no-fill-missing`: Do not create blank columns for missing target fields.
 
